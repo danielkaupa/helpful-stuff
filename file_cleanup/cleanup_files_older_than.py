@@ -57,9 +57,11 @@ import os
 import shutil
 import stat as stat_mod
 import sys
+import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Optional
 
 
 def parse_date(date_str: str) -> float:
@@ -271,7 +273,11 @@ def _dir_platform_meta(s: os.stat_result, platform: str) -> dict:
     return meta
 
 
-def scan_candidate_dir(path: Path, platform: str) -> dict:
+def scan_candidate_dir(
+    path: Path,
+    platform: str,
+    progress_callback: Optional[Callable[[int], None]] = None,
+) -> dict:
     """Collect metadata for one candidate directory and everything inside it.
 
     Walks ``path`` recursively via ``Path.rglob("*")``. For every file
@@ -291,6 +297,11 @@ def scan_candidate_dir(path: Path, platform: str) -> dict:
     platform : str
         Canonical platform name from :func:`resolve_platform`, forwarded to
         :func:`owner_name` and :func:`_dir_platform_meta`.
+    progress_callback : callable, optional
+        Function invoked with the running file count roughly every five
+        seconds while walking the subtree. Use it to emit progress output
+        during long scans on slow media. ``None`` (default) disables
+        progress reporting.
 
     Returns
     -------
@@ -325,6 +336,8 @@ def scan_candidate_dir(path: Path, platform: str) -> dict:
     newest_file = None
     month_counts: Counter = Counter()
     owner_counts: Counter = Counter()
+    last_progress = time.monotonic()
+    PROGRESS_INTERVAL_SEC = 5.0
 
     for item in path.rglob("*"):
         try:
@@ -339,6 +352,12 @@ def scan_candidate_dir(path: Path, platform: str) -> dict:
                 if mtime > newest_file_mtime:
                     newest_file_mtime = mtime
                     newest_file = str(item)
+
+                if progress_callback is not None:
+                    now = time.monotonic()
+                    if now - last_progress >= PROGRESS_INTERVAL_SEC:
+                        progress_callback(file_count)
+                        last_progress = now
         except (FileNotFoundError, PermissionError):
             continue
 
@@ -360,11 +379,35 @@ def scan_candidate_dir(path: Path, platform: str) -> dict:
     return result
 
 
+def _write_manifest_atomic(report: dict, out_path: Path) -> None:
+    """Write ``report`` to ``out_path`` atomically.
+
+    Writes to a sibling ``<name>.tmp`` file first and then calls
+    :func:`os.replace`, which is atomic on POSIX and on Windows. A reader
+    of ``out_path`` therefore always sees either the previous valid
+    manifest or the new one — never a half-written file — and a kill
+    mid-write cannot corrupt an existing manifest.
+
+    Parameters
+    ----------
+    report : dict
+        Manifest contents to serialize as JSON.
+    out_path : pathlib.Path
+        Destination path. The temporary file is created in the same
+        directory so the rename stays within one filesystem.
+    """
+    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    tmp_path.write_text(json.dumps(report, indent=2))
+    os.replace(tmp_path, out_path)
+
+
 def scan(root: Path, cutoff_ts: float, out_path: Path, platform: str) -> None:
     """Scan every top-level subdirectory of ``root`` and write a JSON manifest.
 
-    The function also prints a short summary to stdout for interactive use.
-    It does not delete anything.
+    The function pre-counts the top-level directories and emits live progress
+    to ``stderr`` as it walks each one, so long scans on slow media are
+    observable. It also prints a final summary to ``stdout``. It does not
+    delete anything.
 
     Parameters
     ----------
@@ -404,14 +447,51 @@ def scan(root: Path, cutoff_ts: float, out_path: Path, platform: str) -> None:
     ``eligible_count``, ``eligible_dirs``, ``skipped_recent_inside_count``,
     ``skipped_recent_inside``.
     """
+    # Pre-count the candidate set so progress lines can show "[i/total]".
+    # iterdir() is cheap (a single readdir()) compared to the per-dir recursion.
+    top_level_dirs = sorted(c for c in root.iterdir() if c.is_dir())
+    total = len(top_level_dirs)
+    print(
+        f"Found {total} top-level director{'y' if total == 1 else 'ies'} under {root}.",
+        file=sys.stderr,
+        flush=True,
+    )
+
     results = []
     skipped_recent_inside = []
+    overall_start = time.monotonic()
 
-    for child in root.iterdir():
-        if not child.is_dir():
-            continue
+    def build_report() -> dict:
+        """Snapshot of the manifest reflecting state through the last finished dir."""
+        return {
+            "root": str(root),
+            "platform": platform,
+            "cutoff": datetime.fromtimestamp(cutoff_ts).strftime("%Y-%m-%d"),
+            "eligible_count": len(results),
+            "eligible_dirs": results,
+            "skipped_recent_inside_count": len(skipped_recent_inside),
+            "skipped_recent_inside": skipped_recent_inside,
+        }
 
-        info = scan_candidate_dir(child, platform)
+    for i, child in enumerate(top_level_dirs, start=1):
+        prefix = f"[{i}/{total}]"
+        print(f"{prefix} scanning {child} ...", file=sys.stderr, flush=True)
+
+        dir_start = time.monotonic()
+
+        # Closure captures the current iteration's prefix and dir_start.
+        # scan_candidate_dir invokes this synchronously, so the values stay
+        # bound to *this* iteration.
+        def progress(n: int) -> None:
+            elapsed = time.monotonic() - dir_start
+            print(
+                f"{prefix}   ... {n:,} files so far ({elapsed:.0f}s)",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        info = scan_candidate_dir(child, platform, progress_callback=progress)
+        elapsed = time.monotonic() - dir_start
 
         if info["file_count"] == 0:
             eligible = info["dir_mtime"] < cutoff_ts
@@ -424,20 +504,26 @@ def scan(root: Path, cutoff_ts: float, out_path: Path, platform: str) -> None:
         else:
             skipped_recent_inside.append(info)
 
-    report = {
-        "root": str(root),
-        "platform": platform,
-        "cutoff": datetime.fromtimestamp(cutoff_ts).strftime("%Y-%m-%d"),
-        "eligible_count": len(results),
-        "eligible_dirs": results,
-        "skipped_recent_inside_count": len(skipped_recent_inside),
-        "skipped_recent_inside": skipped_recent_inside,
-    }
+        # Checkpoint the manifest after each top-level dir so a kill mid-scan
+        # leaves a valid file covering everything completed so far.
+        _write_manifest_atomic(build_report(), out_path)
 
-    out_path.write_text(json.dumps(report, indent=2))
+        verdict = "ELIGIBLE" if eligible else "kept (newer content inside)"
+        print(
+            f"{prefix} done: {info['file_count']:,} files in {elapsed:.1f}s → {verdict}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    # Final write covers the empty-root case where the loop never ran.
+    # Otherwise this duplicates the last checkpoint, which is harmless.
+    _write_manifest_atomic(build_report(), out_path)
+
+    overall_elapsed = time.monotonic() - overall_start
     print(f"Wrote scan report: {out_path}")
     print(f"Eligible directories: {len(results)}")
     print(f"Skipped because contents are newer: {len(skipped_recent_inside)}")
+    print(f"Total scan time: {overall_elapsed:.1f}s")
 
 
 def delete_from_manifest(manifest: Path, confirm: bool) -> None:
